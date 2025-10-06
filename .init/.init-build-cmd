@@ -1,0 +1,4 @@
+{
+    "command": "./gradlew build",
+    "working_directory": "/home/kavia/workspace/code-generation/wikigraph-converter-3247-3257/backend"
+}
