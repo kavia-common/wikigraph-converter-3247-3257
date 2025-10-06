@@ -3,12 +3,10 @@ package com.example.backend.service;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Collection;
-import java.util.Locale;
 import java.util.Objects;
 
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.Query;
-import org.neo4j.driver.Result;
 import org.neo4j.driver.Session;
 import org.neo4j.driver.SessionConfig;
 import org.neo4j.driver.TransactionCallback;
@@ -20,14 +18,11 @@ import org.springframework.stereotype.Service;
 /**
  * Service that writes a simple Wikipedia page graph into Neo4j.
  *
- * Semantics:
+ * Behavior:
  *  - MERGE a Page node for the main URL and set the title.
- *  - For each linked URL, MERGE a Page node and set a minimal title derived from the URL slug if present.
+ *  - For each linked URL, MERGE a Page node with a minimal title derived from the URL slug (if possible).
  *  - MERGE a LINKS_TO relationship from the main Page to each linked Page.
- *  - Accumulates the counters (nodesCreated and relationshipsCreated) from all queries and returns them.
- *
- * All writing uses parameterized Cypher queries to avoid injection issues and uses try-with-resources
- * to manage driver resources.
+ *  - Accumulate counters (nodesCreated, relationshipsCreated) and return them.
  */
 @Service
 public class GraphWriterService {
@@ -40,82 +35,57 @@ public class GraphWriterService {
 
     // PUBLIC_INTERFACE
     /**
-     * Write the supplied graph data into Neo4j with MERGE semantics.
+     * Writes the provided page and its links into Neo4j using MERGE semantics.
      *
-     * Steps:
-     * 1) Open a write session.
-     * 2) MERGE (:Page {url: mainUrl}) and SET its title.
-     * 3) For each linked URL, MERGE (:Page {url: linkedUrl}) and optionally set a minimal title from URL slug.
-     * 4) MERGE (main)-[:LINKS_TO]->(linked).
-     * 5) Accumulate counters from result summaries.
-     * 6) Return a small DTO with totals.
-     *
-     * @param mainUrl the absolute Wikipedia page URL of the main page
-     * @param mainTitle the human-readable title of the main page
-     * @param linkedUrls a collection of absolute Wikipedia page URLs linked from the main page
-     * @return GraphWriteResult containing nodesCreated and relationshipsCreated totals
-     * @throws GraphWriteException if any write operation fails
+     * @param mainUrl absolute Wikipedia URL of the main page
+     * @param mainTitle human-readable title of the main page
+     * @param linkedUrls collection of absolute Wikipedia URLs linked from the main page
+     * @return GraphWriteResult totals for nodes and relationships created
+     * @throws GraphWriteException on any failure while writing to Neo4j
      */
     public GraphWriteResult writeGraph(String mainUrl, String mainTitle, Collection<String> linkedUrls) {
         int totalNodesCreated = 0;
         int totalRelationshipsCreated = 0;
 
-        // Use a write session. If a specific DB is needed, SessionConfig can be customized here.
-        try (Session session = driver.session(SessionConfig.defaultConfig())) {
-
-            // Execute writes in a single write transaction for atomicity and performance.
-            GraphWriteResult result = session.executeWrite((TransactionCallback<GraphWriteResult>) tx -> {
+        try (var session = driver.session(SessionConfig.defaultConfig())) {
+            GraphWriteResult txResult = session.executeWrite((TransactionCallback<GraphWriteResult>) tx -> {
                 int nodesCreated = 0;
                 int relationshipsCreated = 0;
 
-                // 1) MERGE main page node and set title
+                // MERGE main page
                 String mergeMainCypher =
                     "MERGE (p:Page {url: $url}) " +
                     "ON CREATE SET p.title = $title " +
-                    "ON MATCH SET p.title = coalesce(p.title, $title) " +
-                    "RETURN p";
-
-                ResultSummary mainSummary = tx.run(
-                    new Query(mergeMainCypher, Values.parameters(
-                        "url", mainUrl,
-                        "title", mainTitle
-                    ))
-                ).consume();
-
+                    "ON MATCH SET p.title = coalesce(p.title, $title)";
+                ResultSummary mainSummary = tx.run(new Query(
+                    mergeMainCypher,
+                    Values.parameters("url", mainUrl, "title", mainTitle)
+                )).consume();
                 nodesCreated += safeNodeCreates(mainSummary.counters());
 
-                // 2) For each linked URL: MERGE node, set minimal title if available, and MERGE relationship
                 if (linkedUrls != null) {
                     for (String linked : linkedUrls) {
                         String minimalTitle = deriveTitleFromUrl(linked);
 
+                        // MERGE linked page
                         String mergeLinkedCypher =
                             "MERGE (l:Page {url: $url}) " +
                             "ON CREATE SET l.title = $title " +
-                            "ON MATCH SET l.title = coalesce(l.title, $title) " +
-                            "RETURN l";
-
-                        ResultSummary linkedSummary = tx.run(
-                            new Query(mergeLinkedCypher, Values.parameters(
-                                "url", linked,
-                                "title", minimalTitle
-                            ))
-                        ).consume();
-
+                            "ON MATCH SET l.title = coalesce(l.title, $title)";
+                        ResultSummary linkedSummary = tx.run(new Query(
+                            mergeLinkedCypher,
+                            Values.parameters("url", linked, "title", minimalTitle)
+                        )).consume();
                         nodesCreated += safeNodeCreates(linkedSummary.counters());
 
                         // MERGE relationship
                         String mergeRelCypher =
                             "MATCH (p:Page {url: $mainUrl}), (l:Page {url: $linkedUrl}) " +
                             "MERGE (p)-[:LINKS_TO]->(l)";
-
-                        ResultSummary relSummary = tx.run(
-                            new Query(mergeRelCypher, Values.parameters(
-                                "mainUrl", mainUrl,
-                                "linkedUrl", linked
-                            ))
-                        ).consume();
-
+                        ResultSummary relSummary = tx.run(new Query(
+                            mergeRelCypher,
+                            Values.parameters("mainUrl", mainUrl, "linkedUrl", linked)
+                        )).consume();
                         relationshipsCreated += safeRelCreates(relSummary.counters());
                     }
                 }
@@ -123,8 +93,8 @@ public class GraphWriterService {
                 return new GraphWriteResult(nodesCreated, relationshipsCreated);
             });
 
-            totalNodesCreated += result.getNodesCreated();
-            totalRelationshipsCreated += result.getRelationshipsCreated();
+            totalNodesCreated += txResult.getNodesCreated();
+            totalRelationshipsCreated += txResult.getRelationshipsCreated();
 
         } catch (Exception e) {
             throw new GraphWriteException("Failed to write graph to Neo4j: " + e.getMessage(), e);
@@ -134,25 +104,22 @@ public class GraphWriterService {
     }
 
     /**
-     * Defensive helper to read nodes created from counters.
+     * Defensive helper to get node creation count from summary counters.
      */
     private static int safeNodeCreates(SummaryCounters counters) {
         return counters != null ? counters.nodesCreated() : 0;
     }
 
     /**
-     * Defensive helper to read relationships created from counters.
+     * Defensive helper to get relationship creation count from summary counters.
      */
     private static int safeRelCreates(SummaryCounters counters) {
         return counters != null ? counters.relationshipsCreated() : 0;
     }
 
     /**
-     * Attempts to derive a minimal, human-readable title from a Wikipedia URL slug.
-     * Example:
-     *  - https://en.wikipedia.org/wiki/Graph_theory -> "Graph theory"
-     *  - https://en.wikipedia.org/wiki/Alan_Turing -> "Alan Turing"
-     * If parsing fails, returns null so that MERGE SET coalesce can keep any existing title.
+     * Derives a minimal title from a Wikipedia URL slug (e.g., Graph_theory -> Graph theory).
+     * Returns null if parsing fails to allow coalesce to preserve existing titles.
      */
     private static String deriveTitleFromUrl(String url) {
         if (url == null || url.isBlank()) {
@@ -160,42 +127,33 @@ public class GraphWriterService {
         }
         try {
             URI uri = new URI(url);
-            String path = uri.getPath(); // e.g., /wiki/Graph_theory
+            String path = uri.getPath();
             if (path == null || path.isBlank()) {
                 return null;
             }
-            // Expect /wiki/Slug
             int idx = path.lastIndexOf('/');
             String slug = idx >= 0 ? path.substring(idx + 1) : path;
             if (slug.isBlank()) {
                 return null;
             }
-            // Replace underscores with spaces and trim
             String candidate = slug.replace('_', ' ').trim();
             if (candidate.isBlank()) {
                 return null;
             }
-            // Capitalize first letter for a nicer look
-            return capitalizeFirst(candidate);
+            // Capitalize first letter only
+            char first = candidate.charAt(0);
+            char upper = Character.toUpperCase(first);
+            if (first == upper) {
+                return candidate;
+            }
+            return upper + candidate.substring(1);
         } catch (URISyntaxException e) {
             return null;
         }
     }
 
-    private static String capitalizeFirst(String s) {
-        if (s == null || s.isEmpty()) {
-            return s;
-        }
-        char first = s.charAt(0);
-        char upper = Character.toUpperCase(first);
-        if (first == upper) {
-            return s;
-        }
-        return upper + s.substring(1);
-    }
-
     /**
-     * Custom runtime exception used to signal write failures.
+     * Runtime exception to indicate graph write failures.
      */
     public static class GraphWriteException extends RuntimeException {
         public GraphWriteException(String message, Throwable cause) {
@@ -204,7 +162,7 @@ public class GraphWriterService {
     }
 
     /**
-     * Small DTO for returning counters from writeGraph.
+     * DTO with aggregated counters from a writeGraph operation.
      */
     public static class GraphWriteResult {
         private final int nodesCreated;
@@ -216,13 +174,11 @@ public class GraphWriterService {
         }
 
         // PUBLIC_INTERFACE
-        /** Number of nodes that were created by the write operations. */
         public int getNodesCreated() {
             return nodesCreated;
         }
 
         // PUBLIC_INTERFACE
-        /** Number of relationships that were created by the write operations. */
         public int getRelationshipsCreated() {
             return relationshipsCreated;
         }
